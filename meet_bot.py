@@ -46,11 +46,12 @@ class AntiIdleThread(threading.Thread):
 
 
 class BotThread(threading.Thread):
-    def __init__(self, urls, profile_path, min_participants, stop_event, log_queue):
+    def __init__(self, urls, profile_path, min_participants, headless, stop_event, log_queue):
         super().__init__()
         self.urls = urls
         self.profile_path = profile_path
         self.min_participants = min_participants
+        self.headless = headless
         self.stop_event = stop_event
         self.log_queue = log_queue
         self.daemon = True
@@ -70,6 +71,11 @@ class BotThread(threading.Thread):
         
         # Mute camera and mic seamlessly
         options.add_argument("--use-fake-ui-for-media-stream")
+        
+        # Headless mode if selected
+        if self.headless:
+            options.add_argument("--headless=new")
+            self.log("Running Chrome in Headless mode (hidden).")
         
         # Set profile path if provided
         if self.profile_path and self.profile_path.strip():
@@ -281,16 +287,21 @@ class App(ctk.CTk):
         self.min_parts_entry.insert(0, "4")
         self.min_parts_entry.grid(row=4, column=1, padx=20, pady=(5, 10), sticky="ew")
 
+        # Headless Checkbox
+        self.headless_var = ctk.BooleanVar(value=False)
+        self.headless_checkbox = ctk.CTkCheckBox(self.main_frame, text="Run in Background (Headless)", variable=self.headless_var)
+        self.headless_checkbox.grid(row=5, column=0, columnspan=2, padx=20, pady=(10, 10), sticky="w")
+
         # Status Log
         self.log_label = ctk.CTkLabel(self.main_frame, text="Status Log:")
-        self.log_label.grid(row=5, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="w")
+        self.log_label.grid(row=6, column=0, columnspan=2, padx=20, pady=(10, 0), sticky="w")
         
         self.log_textbox = ctk.CTkTextbox(self.main_frame, state="disabled")
-        self.log_textbox.grid(row=6, column=0, columnspan=2, padx=20, pady=(5, 10), sticky="nsew")
+        self.log_textbox.grid(row=7, column=0, columnspan=2, padx=20, pady=(5, 10), sticky="nsew")
 
         # Buttons
         self.button_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.button_frame.grid(row=7, column=0, columnspan=2, padx=20, pady=20)
+        self.button_frame.grid(row=8, column=0, columnspan=2, padx=20, pady=20)
         
         self.start_btn = ctk.CTkButton(self.button_frame, text="Start Automation", command=self.start_automation, fg_color="green", hover_color="darkgreen")
         self.start_btn.pack(side="left", padx=10)
@@ -303,9 +314,29 @@ class App(ctk.CTk):
         self.stop_event = threading.Event()
         self.bot_thread = None
         self.idle_thread = None
+        
+        # Load previous URLs if they exist
+        self.load_urls()
 
         # Start queue checker
         self.check_queue()
+        
+    def load_urls(self):
+        try:
+            if os.path.exists("saved_urls.txt"):
+                with open("saved_urls.txt", "r") as f:
+                    content = f.read()
+                    if content.strip():
+                        self.url_textbox.insert("1.0", content)
+        except Exception:
+            pass
+            
+    def save_urls(self, urls_text):
+        try:
+            with open("saved_urls.txt", "w") as f:
+                f.write(urls_text)
+        except Exception:
+            pass
 
     def log(self, message):
         self.log_textbox.configure(state="normal")
@@ -335,8 +366,12 @@ class App(ctk.CTk):
         if not urls:
             self.log("Error: Please enter at least one URL.")
             return
+            
+        # Save URLs for next time
+        self.save_urls(urls_text)
 
         profile_path = self.profile_entry.get()
+        headless_mode = self.headless_var.get()
         try:
             min_parts = int(self.min_parts_entry.get())
         except ValueError:
@@ -354,7 +389,7 @@ class App(ctk.CTk):
         self.idle_thread.start()
         
         # Start Bot Thread
-        self.bot_thread = BotThread(urls, profile_path, min_parts, self.stop_event, self.log_queue)
+        self.bot_thread = BotThread(urls, profile_path, min_parts, headless_mode, self.stop_event, self.log_queue)
         self.bot_thread.start()
 
     def stop_automation(self):
