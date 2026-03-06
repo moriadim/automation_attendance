@@ -86,10 +86,10 @@ class BotThread(threading.Thread):
         # Mute camera and mic seamlessly
         options.add_argument("--use-fake-ui-for-media-stream")
         
-        # Headless mode if selected
-        if self.headless:
-            options.add_argument("--headless=new")
-            self.log("Running Chrome in Headless mode (hidden).")
+        # We will NOT use true Headless here due to Google bot checks breaking easily.
+        # Instead, we'll minimize the window immediately after launch if "headless" is checked.
+        # However, we still pass a few harmless stealth args.
+        options.add_argument('--disable-blink-features=AutomationControlled')
         
         # Set profile path if provided
         if self.profile_path and self.profile_path.strip():
@@ -104,65 +104,103 @@ class BotThread(threading.Thread):
         try:
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=options)
-            self.driver.maximize_window()
+            
+            if self.headless:
+                # Hacky "Headless" that minimizes the window so bot detection doesn't trigger.
+                self.log("Running Chrome in Background (Minimized) mode.")
+                self.driver.minimize_window()
+            else:
+                self.driver.maximize_window()
+                
             return True
         except Exception as e:
             self.log(f"Error initializing Chrome: {str(e)}")
             self.log("Make sure all Chrome instances are closed before using a custom profile!")
             return False
 
-    def join_meeting(self, url):
+    def join_meeting(self, url, retries=3):
         self.log(f"Navigating to {url}...")
-        self.driver.get(url)
-        time.sleep(5)  # Let initial page load
-
-        if self.stop_event.is_set():
-            return False
-
-        # Try to find and click "Join now" or "Ask to join"
-        try:
-            # Wait up to 30 seconds for the button to appear
-            wait = WebDriverWait(self.driver, 30)
-            
-            # Using XPath to match common Join buttons
-            # Language independent approach or generic buttons usually use specific jsnames or classes
-            # Mute mic and camera again just in case the fake-ui didn't block an internal meet prompt
+        
+        for attempt in range(1, retries + 1):
+            if self.stop_event.is_set():
+                return False
+                
             try:
-                # Ctrl+D (Mute Mic), Ctrl+E (Mute Cam) - sending keys to body
-                body = self.driver.find_element(By.TAG_NAME, 'body')
-                body.send_keys(u'\ue009' + 'd') # Keys.CONTROL + d
-                body.send_keys(u'\ue009' + 'e') # Keys.CONTROL + e
-                time.sleep(1)
-            except:
-                pass
-
-            # Find join button
-            self.log("Looking for Join button...")
-            
-            # Common XPath for "Join now" or "Ask to join" spans text
-            join_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//span[contains(text(), 'Join now') or contains(text(), 'Ask to join')]")))
-            button_text = join_button.text
-            self.log(f"Clicking '{button_text}'...")
-            join_button.click()
-            
-            self.log("Successfully clicked Join button. Waiting 10s for meeting to start...")
-            self.send_webhook(f"Just joined meeting at `{url}`!")
-            
-            # Important: Delay 10 seconds before monitoring participants to avoid premature leaving
-            for _ in range(10):
-                if self.stop_event.is_set():
+                self.driver.get(url)
+                time.sleep(5)  # Let initial page load
+    
+                # Try to find and click "Join now" or "Ask to join"
+                # Wait up to 30 seconds for the button to appear
+                wait = WebDriverWait(self.driver, 30)
+                
+                # Dynamic Muting Fallback: Click the camera/mic buttons on screen before joining
+                try:
+                    # Find any element with the mic/cam aria labels and if it contains "Turn off", click it.
+                    # We give it a quick 3-second wait.
+                    quick_wait = WebDriverWait(self.driver, 3)
+                    mic_btn = quick_wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='button' and contains(@aria-label, 'microphone')]")))
+                    if "Turn off" in mic_btn.get_attribute("aria-label"):
+                        mic_btn.click()
+                        time.sleep(1)
+                        
+                    cam_btn = quick_wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='button' and contains(@aria-label, 'camera')]")))
+                    if "Turn off" in cam_btn.get_attribute("aria-label"):
+                        cam_btn.click()
+                        time.sleep(1)
+                except:
+                    # Fallback to keybinds if the JS buttons changed
+                    try:
+                        body = self.driver.find_element(By.TAG_NAME, 'body')
+                        body.send_keys(u'\ue009' + 'd') # Keys.CONTROL + d
+                        body.send_keys(u'\ue009' + 'e') # Keys.CONTROL + e
+                        time.sleep(1)
+                    except:
+                        pass
+    
+                # Find join button
+                self.log(f"Looking for Join button (Attempt {attempt}/{retries})...")
+                
+                # Common XPath for "Join now" or "Ask to join" spans text
+                join_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//span[contains(text(), 'Join now') or contains(text(), 'Ask to join')]")))
+                button_text = join_button.text
+                self.log(f"Clicking '{button_text}'...")
+                join_button.click()
+                
+                self.log("Successfully clicked Join button. Waiting 10s for meeting to start...")
+                self.send_webhook(f"Just joined meeting at `{url}`!")
+                
+                # Important: Delay 10 seconds before monitoring participants to avoid premature leaving
+                for _ in range(10):
+                    if self.stop_event.is_set():
+                        return False
+                    time.sleep(1)
+                
+                return True
+                
+            except Exception as e:
+                self.log(f"Join Attempt {attempt} failed: {str(e)[:50]}...")
+                if attempt < retries:
+                    self.log("Refreshing page and retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    self.log(f"Could not join the meeting after {retries} attempts.")
                     return False
-                time.sleep(1)
-            
-            return True
-            
-        except Exception as e:
-            self.log(f"Could not join the meeting. Error: {str(e)}")
-            return False
 
     def monitor_meeting(self):
         self.log("Starting participant monitoring...")
+        
         while not self.stop_event.is_set():
+            # First, check if the meeting ended naturally (Professor hit "End for all")
+            try:
+                # Look for the famous Google Meet "You left the meeting" heading
+                left_title = self.driver.find_elements(By.XPATH, "//h1[contains(text(), 'left the meeting')]")
+                if left_title:
+                    self.log("Meeting was ended by the host. Leaving monitoring loop.")
+                    self.send_webhook("Host ended the meeting. Moving on to the next one.")
+                    return True
+            except:
+                pass
+                
             try:
                 # Find participant count element.
                 try:
@@ -202,7 +240,7 @@ class BotThread(threading.Thread):
                     except:
                         self.log("Error analyzing participants.")
             except Exception as e:
-                self.log(f"Monitoring error: {str(e)}")
+                self.log(f"Monitoring error (might be transitioning): {str(e)[:50]}...")
             
             # Wait 60 seconds before next check
             for _ in range(60):
